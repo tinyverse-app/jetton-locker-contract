@@ -1,0 +1,311 @@
+#include "imports/stdlib.fc";
+#include "common.fc";
+
+
+const int MINIMUM_REWARD = ONE_TON; ;; MINIMUM_REWARD must be greater than 1 ton
+
+int mod(int x, int y) asm "MOD";
+
+;; storage variables
+
+global int total_jettons_deposited;
+global int total_reward;
+global int deposits_end_time;
+global int vesting_start_time; ;; max 7 Feb 2106
+global int vesting_total_duration; ;; max 135 years
+global int unlock_period;
+global int min_jetton_deposit;
+global int jetton_subwallet_address_inited;
+global int jetton_subwallet_address_init_request_sent;
+global int jetton_tokens_burned;
+global slice jetton_master_address;
+global slice jetton_subwallet_address;
+global cell bill_code;
+
+() load_data() impure inline_ref {
+    slice ds = get_data().begin_parse();
+
+    total_jettons_deposited = ds~load_coins();
+    total_reward = ds~load_coins();
+    jetton_subwallet_address_inited = ds~load_uint(1);
+    jetton_subwallet_address_init_request_sent = ds~load_uint(1);
+    jetton_tokens_burned = ds~load_uint(1);
+    jetton_subwallet_address = ds~load_msg_addr();
+
+    slice params = ds~load_ref().begin_parse(); 
+
+    deposits_end_time = params~load_uint(32);
+    vesting_start_time = params~load_uint(32);
+    vesting_total_duration = params~load_uint(32);
+    unlock_period = params~load_uint(32);
+    min_jetton_deposit = params~load_coins();
+    jetton_master_address = params~load_msg_addr();
+
+    params.end_parse();
+    
+    bill_code = ds~load_ref();
+
+    throw_unless(error::invalid_start_time, deposits_end_time < vesting_start_time);
+    throw_unless(error::invalid_unlock_period, mod(vesting_total_duration, unlock_period) == 0);
+
+    ds.end_parse();
+}
+
+() save_data() impure inline_ref {
+    set_data(
+            begin_cell()
+                    .store_coins(total_jettons_deposited)
+                    .store_coins(total_reward)
+                    .store_uint(jetton_subwallet_address_inited, 1)
+                    .store_uint(jetton_subwallet_address_init_request_sent, 1)
+                    .store_uint(jetton_tokens_burned, 1)
+                    .store_slice(jetton_subwallet_address)
+                    .store_ref(
+                            begin_cell()
+                                    .store_uint(deposits_end_time, 32)
+                                    .store_uint(vesting_start_time, 32)
+                                    .store_uint(vesting_total_duration, 32)
+                                    .store_uint(unlock_period, 32)
+                                    .store_coins(min_jetton_deposit)
+                                    .store_slice(jetton_master_address)
+                            .end_cell()
+                    )
+                    .store_ref(bill_code)
+                    .end_cell()
+    );
+}
+
+int _get_unlocked_amount(int now_time, int total_amount) inline_ref {
+    if (now_time >= vesting_start_time + vesting_total_duration) {
+        return total_amount;
+    }
+
+    if (now_time < vesting_start_time + unlock_period) {
+        return 0;
+    }
+
+    return muldiv(total_amount,
+                  (now_time - vesting_start_time) / unlock_period,
+                  vesting_total_duration / unlock_period);
+}
+
+int _get_amount_to_withdraw(int now_time, int last_withdraw_time, int total_user_deposit) inline {
+    int total_user_deposit_and_reward = muldiv(total_user_deposit, total_reward, total_jettons_deposited);
+
+    int old_amount_to_send = _get_unlocked_amount(last_withdraw_time, total_user_deposit_and_reward);
+    int current_amount_to_send = _get_unlocked_amount(now_time, total_user_deposit_and_reward);
+
+    return current_amount_to_send - old_amount_to_send;
+}
+
+int get_unlocked_amount(int now_time, int total_amount) method_id {
+    load_data();
+    return _get_unlocked_amount(now_time, total_amount);
+}
+
+int get_amount_to_withdraw(int now_time, int last_withdraw_time, int total_user_deposit) method_id {
+    load_data();
+    return _get_amount_to_withdraw(now_time, last_withdraw_time, total_user_deposit);
+}
+
+() return_jettons(int jetton_coins, slice from_address) impure {
+    reject_maybe_jettons(jetton_coins, from_address, jetton_subwallet_address);
+
+    return();
+}
+
+() burn_jettons(int jetton_coins) impure {
+    builder msg = create_msg(BOUNCEABLE, jetton_subwallet_address, 0)
+            .store_uint(jettonop::burn, 32)
+            .store_uint(0, 64) ;; query_id
+            .store_coins(jetton_coins)
+            .store_slice(my_address())
+            ; 
+  
+    send_raw_message(msg.end_cell(), SEND_MODE_CARRY_ALL_BALANCE);
+
+    return();
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { ;; ignore all bounced messages
+        return();
+    }
+    slice sender_address = cs~load_msg_addr();
+    force_chain(sender_address);
+
+    load_data();
+
+    if ((jetton_subwallet_address_inited == 0) & (jetton_subwallet_address_init_request_sent == 0)) {
+        builder msg = create_msg(BOUNCEABLE, jetton_master_address, 0)
+                .store_uint(jettonop::provide_wallet_address, 32)
+                .store_uint(0, 64) ;; query_id
+                .store_slice(my_address())
+                .store_int(0, 1)
+                ; 
+      
+        send_raw_message(msg.end_cell(), SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+    
+        jetton_subwallet_address_init_request_sent = 1;
+
+        save_data();
+    }
+
+    if (in_msg_body.slice_empty?()) {
+        return();
+    }
+
+    int op = in_msg_body~load_uint(32);
+
+    if (op == jettonop::excesses) { ;; burned jettons
+        return();
+    }
+
+    if (op == jettonop::take_wallet_address) { ;; our address
+        
+        throw_unless(error::invalid_bill_sender, equal_slices(sender_address, jetton_master_address));
+      
+        if (jetton_subwallet_address_inited == 0) {
+            in_msg_body~load_uint(64); ;; query_id
+            slice addr = in_msg_body~load_msg_addr();
+            jetton_subwallet_address = addr;
+            jetton_subwallet_address_inited = 1;
+            save_data();
+        }
+        return();
+
+    }
+
+    if (op == op::withdraw_from_bill) { ;; probably withdraw from bill
+       
+        throw_unless(error::not_inited, jetton_subwallet_address_inited == 1);
+
+        slice user_address = in_msg_body~load_msg_addr();
+        throw_unless(error::invalid_bill_sender, equal_slices(sender_address, calculate_bill_address(my_address(), user_address, bill_code)));
+
+        int total_user_deposit = in_msg_body~load_coins();
+        int last_withdraw_time = in_msg_body~load_uint(32);
+        int now_time = in_msg_body~load_uint(32);
+        in_msg_body.end_parse();
+
+        int amount_to_send = _get_amount_to_withdraw(now_time, last_withdraw_time, total_user_deposit);
+
+        builder msg = create_msg(NON_BOUNCEABLE, user_address, amount_to_send);
+        send_raw_message(msg.end_cell(), SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+
+        return();
+
+    }
+
+    if (op == jettonop::transfer_notification) { ;; probably received tokens
+    
+        in_msg_body~load_uint(64); ;; query_id
+        int jetton_coins = in_msg_body~load_coins();
+        slice from_address = in_msg_body~load_msg_addr();
+    
+        ;; just suppose that it was an jetton transfer
+        ;; if not - we can't lose anything here
+        if ((jetton_subwallet_address_inited == 0) |
+            (~ equal_slices(sender_address, jetton_subwallet_address)) |
+            (now() > deposits_end_time)
+           ) {
+       
+            reject_maybe_jettons(jetton_coins, from_address, sender_address);
+            return();
+        
+        }
+       
+        ;; we don't want to accept too small deposits
+        if ((jetton_coins < min_jetton_deposit) | (msg_value < ONE_TON)) {
+            
+            reject_maybe_jettons(jetton_coins, from_address, sender_address);
+            return();
+        
+        }
+
+        total_jettons_deposited += jetton_coins;
+
+        cell state_init = calculate_bill_state_init(my_address(), from_address, bill_code);
+        slice bill_address = calculate_address_by_state_init(state_init);
+
+        cell deposit_body = begin_cell()
+                .store_uint(op::deposit_to_bill, 32)
+                .store_coins(jetton_coins)
+                .end_cell();
+
+        builder msg = begin_cell()
+                .store_uint(BOUNCEABLE, 6)
+                .store_slice(bill_address)
+                .store_coins(0)
+                .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+                .store_ref(state_init)
+                .store_ref(deposit_body);
+
+        send_raw_message(msg.end_cell(), SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+
+        save_data();
+
+        return();
+  
+    }
+
+    throw_unless(error::only_text_comments_supported, op == 0);
+    int action = in_msg_body~load_uint(8);
+    in_msg_body.end_parse();
+    int is_withdraw = action == "w"u;
+    int is_reward = action == "r"u;
+    int is_burn = action == "b"u;
+
+    throw_unless(error::invalid_comment, is_withdraw | is_reward | is_burn);
+
+    if (is_reward) {
+
+        throw_unless(error::not_enough_coins_for_reward, msg_value >= MINIMUM_REWARD);
+        throw_unless(error::deposits_time_ended, now() < deposits_end_time);
+        total_reward += (msg_value - ONE_TON / 2);
+        save_data();
+
+    } elseif (is_burn) {
+
+        throw_unless(error::not_enough_coins_for_reward, msg_value >= ONE_TON);
+        throw_unless(error::deposits_time_ended, now() >= deposits_end_time);
+        throw_unless(error::deposits_time_ended, jetton_tokens_burned == 0);
+      
+        burn_jettons(total_jettons_deposited);
+     
+        jetton_tokens_burned = 1;
+
+        save_data();
+
+    } else { ;; is_withdraw
+
+        throw_unless(error::msg_value_at_least_one_ton, msg_value >= ONE_TON);
+        throw_unless(error::withdraw_time_not_started, now() >= vesting_start_time + unlock_period);
+        slice bill_address = calculate_bill_address(my_address(), sender_address, bill_code);
+
+        builder msg = create_msg(BOUNCEABLE, bill_address, 0)
+                .store_uint(0, 32) ;; op
+                .store_uint("w"u, 8);
+
+        send_raw_message(msg.end_cell(), SEND_MODE_CARRY_ALL_REMAINING_MESSAGE_VALUE);
+
+    }
+
+}
+
+(int, int, int, int, int, int, int, slice) get_locker_data() method_id {
+    load_data();
+    return (total_jettons_deposited, total_reward, deposits_end_time, vesting_start_time, vesting_total_duration, unlock_period, min_jetton_deposit, jetton_master_address);
+}
+
+(int, int, int, int, int, int, int, slice, slice) get_locker_data_full() method_id {
+    load_data();
+    return (total_jettons_deposited, total_reward, deposits_end_time, vesting_start_time, vesting_total_duration, unlock_period, min_jetton_deposit, jetton_master_address, jetton_subwallet_address);
+}
+
+slice get_bill_address(slice user_address) method_id {
+    load_data();
+    return calculate_bill_address(my_address(), user_address, bill_code);
+}
