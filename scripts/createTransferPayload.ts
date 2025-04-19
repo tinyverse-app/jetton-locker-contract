@@ -20,8 +20,8 @@ export class SimpleContract implements Contract {
 }
 
 export async function run(provider: NetworkProvider) {
-    const LOCKER_ADDRESS = Address.parse('EQB78SZlzlvTqbqVnxVX4ZiyVuhwsFZnXCx1LiiX5UxuEwNw'); 
-    const USER_WALLET_ADDRESS = Address.parse('UQDpc8tkuE8B83JZO7tDFPNKJWNDNJIzXmOFERns15nIzw5B'); 
+    const LOCKER_ADDRESS = Address.parse('LOCKER_ADDRESS'); 
+    const USER_WALLET_ADDRESS = Address.parse('YOUR_WALLET'); 
     const JETTONS_TO_TRANSFER  = toNano(200000);
 
     const locker = provider.open(
